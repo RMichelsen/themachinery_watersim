@@ -1,0 +1,109 @@
+imports : [
+    { name : "N" type: "int" }
+    { name : "L" type: "int" }
+    { name : "RT" type: "float" }
+    { name : "T" type: "float" }
+    { name : "h0tilde" type: "texture_2d" element_type: "float4" }
+    { name : "h0tilde_conj" type: "texture_2d" element_type: "float4" }
+    { name : "h0tilde_tx" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "h0tilde_ty" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "h0tilde_tz" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "h0tilde_slope_x" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "h0tilde_slope_z" type: "texture_2d" element_type: "float4" uav: true }
+]
+
+common : [[
+    #define M_PI 3.1415926535897932384626433832795
+    #define M_G 9.81
+
+    struct Complex {
+        float re;
+        float im;
+    };
+
+    Complex make_complex(float re, float im) {
+        Complex c;
+        c.re = re;
+        c.im = im;
+        return c;
+    }
+
+    Complex add(Complex z, Complex w) {
+        return make_complex(z.re + w.re, z.im + w.im);
+    }
+
+    Complex mul(Complex z, Complex w) {
+        return make_complex((z.re * w.re) - (z.im * w.im), (z.re * w.im) + (w.re * z.im));
+    }
+
+    float dispersion(float2 k) {
+        float RT = load_RT();
+        float w_0 = 2.0f * M_PI / RT;
+        return floor(sqrt(M_G * sqrt((k.x * k.x) + (k.y * k.y))) / w_0) * w_0;
+    }
+]]
+
+compute_shader : {
+    import_system_semantics : [
+        "dispatch_thread_id"
+    ]
+
+    attributes : {
+        num_threads: [ 32, 32, 1 ]
+    }
+
+    code : [[
+        int N = load_N();
+        int L = load_L();
+        float T = load_T();
+
+        Texture2D<float4> h0tilde = get_h0tilde();
+        Texture2D<float4> h0tilde_conj = get_h0tilde_conj();
+        RWTexture2D<float4> h0tilde_tx = get_h0tilde_tx();
+        RWTexture2D<float4> h0tilde_ty = get_h0tilde_ty();
+        RWTexture2D<float4> h0tilde_tz = get_h0tilde_tz();
+        RWTexture2D<float4> h0tilde_slope_x = get_h0tilde_slope_x();
+        RWTexture2D<float4> h0tilde_slope_z = get_h0tilde_slope_z();
+
+        float n_prime = dispatch_thread_id.x;
+        float m_prime = dispatch_thread_id.y;
+        float2 k = float2(M_PI * (2 * n_prime - N) / L, M_PI * (2 * m_prime - N) / L);
+
+        float4 h0tilde_sample = h0tilde.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0));
+        float4 h0tilde_conj_sample = h0tilde_conj.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0));
+
+        Complex c_h0tilde = make_complex(h0tilde_sample.r, h0tilde_sample.g);
+        Complex c_h0tilde_conj = make_complex(h0tilde_conj_sample.r, h0tilde_conj_sample.g);
+
+        // Use Eulers formula to compute the time-dependent variables hkt_(x,y,z)
+        float w = dispersion(k);
+        Complex hkt_x, hkt_y, hkt_z, hkt_slopex, hkt_slopez;
+        float cosine = cos(w * T);
+        float sine = sin(w * T);
+
+        hkt_y = add(mul(c_h0tilde, make_complex(cosine, sine)), mul(c_h0tilde_conj, make_complex(cosine, -sine)));
+
+        float k_len = sqrt((k.x * k.x) + (k.y * k.y));
+        if (k_len < 0.000001f) {
+            hkt_x = make_complex(0.0f, 0.0f);
+            hkt_z = make_complex(0.0f, 0.0f);
+        }
+        else {
+            hkt_x = mul(hkt_y, make_complex(0.0f, -k.x / k_len));
+            hkt_z = mul(hkt_y, make_complex(0.0f, -k.y / k_len));
+        }
+
+        hkt_slopex = mul(hkt_y, make_complex(0.0f, k.x));
+        hkt_slopez = mul(hkt_y, make_complex(0.0f, k.y));
+
+        h0tilde_tx[dispatch_thread_id.xy] = float4(hkt_x.re, hkt_x.im, 0.0f, 0.0f);
+        h0tilde_ty[dispatch_thread_id.xy] = float4(hkt_y.re, hkt_y.im, 0.0f, 0.0f);
+        h0tilde_tz[dispatch_thread_id.xy] = float4(hkt_z.re, hkt_z.im, 0.0f, 0.0f);
+        h0tilde_slope_x[dispatch_thread_id.xy] = float4(hkt_slopex.re, hkt_slopex.im, 0.0f, 0.0f);
+        h0tilde_slope_z[dispatch_thread_id.xy] = float4(hkt_slopez.re, hkt_slopez.im, 0.0f, 0.0f);
+    ]]
+}
+
+compile : {
+    includes: [ "common" ]
+}

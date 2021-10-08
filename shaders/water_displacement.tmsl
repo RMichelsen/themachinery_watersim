@@ -1,0 +1,47 @@
+imports : [
+    { name : "h0tilde_dx" type: "texture_2d" element_type: "float4" }
+    { name : "h0tilde_dy" type: "texture_2d" element_type: "float4" }
+    { name : "h0tilde_dz" type: "texture_2d" element_type: "float4" }
+    { name : "h0tilde_slope_dx" type: "texture_2d" element_type: "float4" }
+    { name : "h0tilde_slope_dz" type: "texture_2d" element_type: "float4" }
+    { name : "displacement_map" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "normal_map" type: "texture_2d" element_type: "float4" uav: true }
+]
+
+compute_shader : {
+    import_system_semantics : [
+        "dispatch_thread_id"
+    ]
+
+    attributes : {
+        num_threads: [ 32, 32, 1 ]
+    }
+
+    code : [[
+        // Choppy-ness factor
+        float lambda = -0.8f;
+
+        // Assemble the RGB displacement map from the individual displacement components
+        Texture2D<float4> h0tilde_dx = get_h0tilde_dx();
+        Texture2D<float4> h0tilde_dy = get_h0tilde_dy();
+        Texture2D<float4> h0tilde_dz = get_h0tilde_dz();
+        Texture2D<float4> h0tilde_slope_dx = get_h0tilde_slope_dx();
+        Texture2D<float4> h0tilde_slope_dz = get_h0tilde_slope_dz();
+
+        RWTexture2D<float4> displacement_map = get_displacement_map();
+        RWTexture2D<float4> normal_map = get_normal_map();
+
+        float x_displ = h0tilde_dx.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0)).x;
+        float y_displ = h0tilde_dy.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0)).x;
+        float z_displ = h0tilde_dz.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0)).x;
+        displacement_map[dispatch_thread_id.xy] = float4(x_displ * lambda, y_displ, z_displ * lambda, 0.0f);
+
+        // Assemble the normal map 
+        float4 D_slopex_val = h0tilde_slope_dx.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0));
+        float4 D_slopez_val = h0tilde_slope_dz.Load(uint3(dispatch_thread_id.x, dispatch_thread_id.y, 0));
+        float3 N = normalize(float3(-D_slopex_val.x, 1.0f, -D_slopez_val.x));
+        normal_map[dispatch_thread_id.xy] = float4(N, 0.0f);
+    ]]
+}
+
+compile : {}

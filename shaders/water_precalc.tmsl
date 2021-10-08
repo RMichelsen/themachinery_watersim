@@ -1,0 +1,102 @@
+imports : [
+    { name : "W" type: "float2" }
+    { name : "N" type: "int" }
+    { name : "A" type: "float" }
+    { name : "L" type: "int" }
+    { name : "h0tilde" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "h0tilde_conj" type: "texture_2d" element_type: "float4" uav: true }
+    { name : "unif_randoms" type: "buffer" }
+]
+
+common : [[
+    #define M_PI 3.1415926535897932384626433832795
+    #define M_G 9.81
+
+    struct Complex {
+        float re;
+        float im;
+    };
+
+    Complex make_complex(float re, float im) {
+        Complex c;
+        c.re = re;
+        c.im = im;
+        return c;
+    }
+
+    Complex conj(Complex w) {
+        return make_complex(w.re, -w.im);
+    }
+
+    float phillips(float2 k) {
+        float2 W = load_W();
+        float A = load_A();
+
+        float k_len = sqrt((k.x * k.x) + (k.y * k.y));
+        if (k_len == 0.0f) return 0.0f;
+        float k_len_squared = k_len * k_len;
+
+        // Largest possible wave from constant wind of velocity V
+        float w_len = sqrt((W.x * W.x) + (W.y * W.y));
+        float w_L = (w_len * w_len) / M_G;
+
+        float2 k_unit = float2(k.x / k_len, k.y / k_len);
+        float2 w_unit = float2(W.x / w_len, W.y / w_len);
+        float k_dot_w = dot(k_unit, w_unit);
+        float k_dot_w6 = k_dot_w * k_dot_w * k_dot_w * k_dot_w * k_dot_w * k_dot_w;
+
+        float damping = 0.00001f;
+
+        return A * (exp(-1.0f / (k_len_squared * w_L * w_L)) / (k_len_squared * k_len_squared)) * k_dot_w6 * exp(-k_len_squared * damping);
+    }
+
+    float4 gauss(float4 unif_randoms) {
+        float u0 = 2.0f * M_PI * unif_randoms.x;
+        float v0 = sqrt(-2.0f * log(unif_randoms.y));
+        float u1 = 2.0f * M_PI * unif_randoms.z;
+        float v1 = sqrt(-2.0f * log(unif_randoms.w));
+
+        return float4(v0 * cos(u0), v0 * sin(u0), v1 * cos(u1), v1 * sin(u1));
+    }
+
+    Complex compute_h0tilde(float2 randoms, float2 k) {
+        float pf = sqrt(phillips(k) / 2.0f);
+        return make_complex(randoms.x * pf, randoms.y * pf);
+    }  
+]]
+
+compute_shader : {
+    import_system_semantics : [
+        "dispatch_thread_id"
+    ]
+
+    attributes : {
+        num_threads: [ 32, 32, 1 ]
+    }
+
+    code : [[
+        int N = load_N();
+        int L = load_L();
+
+        uint global_idx = dispatch_thread_id.y * N + dispatch_thread_id.x;
+        float n_prime = dispatch_thread_id.x;
+        float m_prime = dispatch_thread_id.y;
+        float2 k = float2(M_PI * (2 * n_prime - N) / L, M_PI * (2 * m_prime - N) / L);
+
+        ByteAddressBuffer unif_randoms = get_unif_randoms();
+        float4 gauss_rnds = gauss(unif_randoms.Load<float4>(global_idx * sizeof(float4)));
+
+        Complex c_h0tilde = compute_h0tilde(gauss_rnds.xy, k);
+        Complex c_h0tilde_conj = conj(compute_h0tilde(gauss_rnds.zw, -k));
+
+        RWTexture2D<float4> h0tilde = get_h0tilde();
+        RWTexture2D<float4> h0tilde_conj = get_h0tilde_conj();
+
+        h0tilde[dispatch_thread_id.xy] = float4(c_h0tilde.re, c_h0tilde.im, 0.0f, 0.0f);
+        h0tilde_conj[dispatch_thread_id.xy] = float4(c_h0tilde_conj.re, c_h0tilde_conj.im, 0.0f, 0.0f);
+    ]]
+}
+
+compile : {
+    includes: [ "common" ]
+}

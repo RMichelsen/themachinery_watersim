@@ -1,0 +1,117 @@
+imports : [
+    { name : "vertical_pass" type: "int" }
+    { name : "input_image" type: "texture_2d" element_type: "float4" }
+    { name : "output_image" type: "texture_2d" element_type: "float4" uav: true}
+]
+
+common : [[
+    #define M_TWOPI 6.283185307179586476925286766559
+    #define RESOLUTION 1024
+    #define PASS_COUNT 10
+
+    struct Complex {
+        float re;
+        float im;
+    };
+
+    Complex make_complex(float re, float im) {
+        Complex c;
+        c.re = re;
+        c.im = im;
+        return c;
+    }
+
+    Complex add(Complex z, Complex w) {
+        return make_complex(z.re + w.re, z.im + w.im);
+    }
+
+    Complex mul(Complex z, Complex w) {
+        return make_complex((z.re * w.re) - (z.im * w.im), (z.re * w.im) + (w.re * z.im));
+    }
+
+    Complex mul(Complex z, float fac) {
+        return make_complex(z.re * fac, z.im * fac);
+    }
+
+    groupshared Complex pingpong[2][RESOLUTION];
+    void get_butterfly_values(int pass_index, uint pos, out uint2 indices, out Complex w) {
+        const uint sec_width = 2u << pass_index;
+        const uint half_sec_width = sec_width / 2;
+
+        const uint sec_start_offset = pos & ~(sec_width - 1);
+        const uint half_sec_offset = pos & (half_sec_width - 1);
+        const uint sec_offset = pos & (sec_width - 1);
+
+        const float k = (M_TWOPI * float(sec_offset)) / float(sec_width);
+        w = make_complex(cos(k), sin(k));
+
+        indices.x = sec_start_offset + half_sec_offset;
+        indices.y = sec_start_offset + half_sec_offset + half_sec_width;
+
+        if (pass_index == 0) {
+            indices = reversebits(indices) >> (32 - PASS_COUNT) & (RESOLUTION - 1);
+        }
+    }
+
+    // Perform the butterfly calculation (multiply by 0.5 since its an inverse FFT, its possible to scale at the end by 1/N^2 instead)
+    void butterfly_pass(int pass_index, uint local_index, int pingpong_index, out Complex res) {
+        uint2 indices;
+        Complex w;
+        get_butterfly_values(pass_index, local_index, indices, w);
+
+        Complex c0 = pingpong[pingpong_index][indices.x];
+        Complex c1 = pingpong[pingpong_index][indices.y];
+        res = mul(add(c0, mul(c1, w)), 0.5f);
+    }
+]]
+
+compute_shader : {
+    import_system_semantics : [
+        "dispatch_thread_id"
+    ]
+
+    attributes : {
+        num_threads: [ 1024, 1, 1 ]
+    }
+
+    code : [[
+        int vertical_pass = load_vertical_pass();
+
+        uint local_idx = dispatch_thread_id.x;
+        uint2 pos = vertical_pass ? dispatch_thread_id.yx : dispatch_thread_id.xy;
+
+        Texture2D<float4> input_image = get_input_image();
+        float2 entry = input_image.Load(uint3(pos.x, pos.y, 0)).rg;
+
+        pingpong[0][local_idx] = make_complex(entry.x, entry.y);
+
+        int2 pingpong_indices = int2(0, 1);
+
+        for (int i = 0; i < PASS_COUNT - 1; i++) {
+            GroupMemoryBarrierWithGroupSync();
+
+            butterfly_pass(i, local_idx, pingpong_indices.x, pingpong[pingpong_indices.y][local_idx]);
+
+            pingpong_indices.xy = pingpong_indices.yx;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        RWTexture2D<float4> output_image = get_output_image();
+        Complex res;
+        if (vertical_pass) {
+            float sign_factor = (dispatch_thread_id.x + dispatch_thread_id.y) % 2 == 0 ? -1.0f : 1.0f;
+            butterfly_pass(PASS_COUNT - 1, local_idx, pingpong_indices.x, res);
+
+            output_image[pos.xy] = float4(res.re * sign_factor, res.re * sign_factor, res.re * sign_factor, 0.0f);
+        }
+        else {
+            butterfly_pass(PASS_COUNT - 1, local_idx, pingpong_indices.x, res);
+            output_image[pos.xy] = float4(res.re, res.im, 0.0f, 0.0f);
+        }
+    ]]
+}
+
+compile : {
+    includes: [ "common" ]
+}
